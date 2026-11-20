@@ -30,6 +30,11 @@ def _tmp_dir() -> Path:
     return _data_dir() / "tmp"
 
 
+def handoff_dir() -> Path:
+    """Directory holding finished handover Parquet files (on the data volume)."""
+    return _data_dir() / "handoff"
+
+
 # Module-level handles are refreshed on every init_db(); helpers resolve
 # paths through the functions above so test fixtures can switch DATA_DIR.
 DB_PATH: Path = _db_path()
@@ -87,6 +92,22 @@ def init_db() -> None:
         )
         """
     )
+    _writer.execute(
+        """
+        CREATE TABLE IF NOT EXISTS meta_handoff_jobs (
+            job_id      VARCHAR PRIMARY KEY,
+            gen_round1  BIGINT NOT NULL,
+            gen_round2  BIGINT NOT NULL,
+            status      VARCHAR NOT NULL,
+            created_at  TIMESTAMP NOT NULL DEFAULT current_timestamp,
+            finished_at TIMESTAMP,
+            file_name   VARCHAR,
+            n_rows      BIGINT,
+            reason      VARCHAR
+        )
+        """
+    )
+    handoff_dir().mkdir(parents=True, exist_ok=True)
     # Leftover staging tables from a process killed mid-upload.
     rows = _writer.execute(
         "SELECT table_name FROM information_schema.tables "
@@ -263,3 +284,65 @@ def _drop_generation(generation: int) -> None:
     con.execute(f'DROP TABLE IF EXISTS "{replicate_table(generation)}"')
     con.execute("DELETE FROM meta_refcount WHERE generation = ?", [generation])
     con.execute("DELETE FROM meta_generations WHERE generation = ?", [generation])
+
+
+# ---------------------------------------------------------------- handoff jobs
+HANDOFF_COLUMNS = (
+    "job_id", "gen_round1", "gen_round2", "status", "created_at",
+    "finished_at", "file_name", "n_rows", "reason",
+)
+
+
+def insert_handoff_job(job_id: str, gen1: int, gen2: int) -> None:
+    with _lock:
+        _check().execute(
+            "INSERT INTO meta_handoff_jobs "
+            "(job_id, gen_round1, gen_round2, status) VALUES (?, ?, ?, 'running')",
+            [job_id, gen1, gen2],
+        )
+
+
+def get_handoff_job(job_id: str) -> tuple | None:
+    with _lock:
+        return _check().execute(
+            f"SELECT {', '.join(HANDOFF_COLUMNS)} FROM meta_handoff_jobs "
+            "WHERE job_id = ?",
+            [job_id],
+        ).fetchone()
+
+
+def list_handoff_jobs(limit: int = 50) -> list[tuple]:
+    with _lock:
+        cols = ", ".join(HANDOFF_COLUMNS)
+        return _check().execute(
+            f"SELECT {cols} FROM meta_handoff_jobs ORDER BY created_at DESC, job_id DESC "
+            "LIMIT ?",
+            [int(limit)],
+        ).fetchall()
+
+
+def list_running_handoff_jobs() -> list[tuple]:
+    with _lock:
+        cols = ", ".join(HANDOFF_COLUMNS)
+        return _check().execute(
+            f"SELECT {cols} FROM meta_handoff_jobs WHERE status = 'running' "
+            "ORDER BY created_at"
+        ).fetchall()
+
+
+def mark_handoff_ready(job_id: str, file_name: str, n_rows: int) -> None:
+    with _lock:
+        _check().execute(
+            "UPDATE meta_handoff_jobs SET status = 'ready', finished_at = current_timestamp, "
+            "file_name = ?, n_rows = ?, reason = NULL WHERE job_id = ?",
+            [file_name, int(n_rows), job_id],
+        )
+
+
+def mark_handoff_failed(job_id: str, reason: str) -> None:
+    with _lock:
+        _check().execute(
+            "UPDATE meta_handoff_jobs SET status = 'failed', finished_at = current_timestamp, "
+            "reason = ? WHERE job_id = ?",
+            [reason[:1000], job_id],
+        )

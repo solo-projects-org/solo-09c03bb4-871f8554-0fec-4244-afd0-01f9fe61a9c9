@@ -7,9 +7,9 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
-from . import analysis, db, ingest
+from . import analysis, db, handoff, ingest
 
 UPLOAD_ROOT = Path(os.environ.get("UPLOAD_TMP_DIR", str(db.TMP_DIR)))
 
@@ -18,6 +18,8 @@ UPLOAD_ROOT = Path(os.environ.get("UPLOAD_TMP_DIR", str(db.TMP_DIR)))
 async def lifespan(app: FastAPI):
     UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
     db.init_db()
+    # Requeue handover jobs interrupted by a restart and start the worker.
+    handoff.start_worker()
     yield
 
 
@@ -99,3 +101,46 @@ def result(district: str) -> dict:
         return analysis.compute(district)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+# ------------------------------------------------------------- handover files
+@app.post("/api/handoff/jobs")
+def create_handoff_job() -> JSONResponse:
+    """Snapshot the two published rounds and start one handover job."""
+    try:
+        job = handoff.create_job()
+    except handoff.HandoffError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return JSONResponse(job.to_payload(), status_code=202)
+
+
+@app.get("/api/handoff/jobs")
+def handoff_jobs() -> dict:
+    return {"jobs": [job.to_payload() for job in handoff.list_jobs()]}
+
+
+@app.get("/api/handoff/jobs/{job_id}")
+def handoff_job_status(job_id: str) -> dict:
+    job = handoff.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="交接任务不存在")
+    return job.to_payload()
+
+
+@app.get("/api/handoff/jobs/{job_id}/download")
+def handoff_job_download(job_id: str):
+    job = handoff.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="交接任务不存在")
+    if job.status != "ready" or not job.file_name:
+        detail = job.reason or "交接文件尚未生成完成"
+        raise HTTPException(status_code=409, detail=detail)
+    path = handoff.job_file(job)
+    if not path.is_file():
+        # Metadata says ready but the file is missing from the volume.
+        raise HTTPException(status_code=409, detail="交接文件在数据卷上缺失，请重新发起生成")
+    return FileResponse(
+        path,
+        media_type="application/vnd.apache.parquet",
+        filename=job.file_name,
+    )

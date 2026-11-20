@@ -70,6 +70,19 @@
   <div class="result" id="result"></div>
 </div>
 
+<div class="card" style="margin-top:16px">
+  <h2>交接文件生成（Parquet）</h2>
+  <div class="sub" style="margin:0 0 10px">
+    以点击生成时已发布的两轮为准，按轮次、区列出主权重与各重抽编号的总权重、乘公交权重之和；
+    生成期间换表不影响本任务，两轮重抽编号不一致与权重和为零的行均照原样保留。
+  </div>
+  <button onclick="createHandoff()" id="h-btn">生成交接文件</button>
+  <div class="msg" id="h-msg"></div>
+  <table id="handoff-table" style="margin-top:12px"><thead>
+    <tr><th>任务</th><th>状态</th><th>两轮代际（一/二）</th><th>行数</th><th>创建时间</th><th>下载 / 原因</th></tr>
+  </thead><tbody></tbody></table>
+</div>
+
 <div class="muted">
   口径：主权重比例 p = Σ(权重×是否乘公交) / Σ(权重)，比例差为第二轮减第一轮；重抽按相同 <code>rep_id</code> 配对，
   区间端点取各次重抽比例差的线性插值 2.5% 与 97.5% 分位数（type-7）。<br>
@@ -164,8 +177,57 @@ async function runQuery() {
   box.innerHTML = html;
 }
 
+// ------------------------------------------------------------- handover file
+const STATUS_TEXT = { running: "生成中", ready: "已完成", failed: "失败" };
+
+async function createHandoff() {
+  const msg = document.getElementById("h-msg");
+  const btn = document.getElementById("h-btn");
+  msg.className = "msg"; msg.textContent = "";
+  btn.disabled = true; msg.textContent = "正在创建生成任务…";
+  try {
+    const resp = await fetch("/api/handoff/jobs", { method: "POST" });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || "创建失败");
+    msg.className = "msg ok";
+    msg.textContent = `任务 ${data.job_id} 已创建，固定使用第 ${data.generation_round1} / ${data.generation_round2} 代输入，生成完成后给出下载链接。`;
+  } catch (e) {
+    msg.className = "msg err"; msg.textContent = e.message;
+  } finally {
+    btn.disabled = false;
+    refreshHandoff();
+  }
+}
+
+async function refreshHandoff() {
+  const resp = await fetch("/api/handoff/jobs");
+  const data = await resp.json();
+  const tb = document.querySelector("#handoff-table tbody");
+  tb.innerHTML = "";
+  for (const j of data.jobs) {
+    const tr = document.createElement("tr");
+    const created = (j.created_at || "").replace("T", " ").replace(/\..*/, "");
+    let tail;
+    if (j.status === "ready") {
+      tail = `<a href="${j.download_url}">下载 ${j.file_name}</a>`;
+    } else if (j.status === "failed") {
+      tail = `<span class="err">${j.reason || "生成失败"}</span>`;
+    } else {
+      tail = '<span class="muted">生成中，请稍候…</span>';
+    }
+    tr.innerHTML = `<td>${j.job_id}</td>
+      <td><span class="pill ${j.status === "ready" ? "on" : j.status === "failed" ? "off" : "on"}">${STATUS_TEXT[j.status] || j.status}</span></td>
+      <td>${j.generation_round1} / ${j.generation_round2}</td>
+      <td>${j.n_rows === null ? "—" : fmtInt(j.n_rows)}</td>
+      <td>${created}</td><td>${tail}</td>`;
+    tb.appendChild(tr);
+  }
+}
+
 refresh();
 setInterval(refresh, 5000);
+refreshHandoff();
+setInterval(refreshHandoff, 3000);
 </script>
 </body>
 </html>
