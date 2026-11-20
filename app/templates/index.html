@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>公交出行比例两轮重抽分析</title>
+<style>
+  :root { --bd:#d0d7de; --bg:#f6f8fa; --blue:#0969da; --red:#cf222e; --green:#1a7f37; }
+  * { box-sizing: border-box; }
+  body { font-family: "Noto Sans CJK SC","PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+         margin:0; padding:24px; color:#1f2328; background:var(--bg); }
+  h1 { font-size:22px; margin:0 0 4px; }
+  .sub { color:#57606a; font-size:13px; margin-bottom:20px; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-bottom:20px; }
+  .card { background:#fff; border:1px solid var(--bd); border-radius:8px; padding:16px; }
+  .card h2 { font-size:16px; margin:0 0 12px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--bd); }
+  th { color:#57606a; font-weight:600; }
+  input[type=file] { font-size:13px; margin-bottom:10px; width:100%; }
+  button { background:var(--blue); color:#fff; border:0; border-radius:6px;
+           padding:8px 16px; font-size:14px; cursor:pointer; }
+  button:disabled { background:#8c959f; cursor:not-allowed; }
+  .msg { font-size:13px; margin-top:10px; white-space:pre-wrap; }
+  .ok { color:var(--green); } .err { color:var(--red); }
+  .pill { display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; }
+  .pill.on { background:#dafbe1; color:var(--green); }
+  .pill.off { background:#f3f4f6; color:#57606a; }
+  select { padding:8px; font-size:14px; min-width:240px; border:1px solid var(--bd); border-radius:6px; }
+  .result { margin-top:16px; font-size:14px; }
+  .kv { display:grid; grid-template-columns:160px 1fr; gap:6px 12px; }
+  .kv .k { color:#57606a; }
+  .big { font-size:20px; font-weight:600; }
+  .muted { color:#57606a; font-size:12px; margin-top:24px; line-height:1.7; }
+  code { background:#eff1f3; padding:1px 5px; border-radius:4px; }
+</style>
+</head>
+<body>
+<h1>公交出行比例两轮重抽分析</h1>
+<div class="sub">每轮成套上传样本 CSV（sample_id, district, bus, main_weight）与重抽权重 Parquet（sample_id, rep_id, weight）。校验失败不会影响已发布数据。</div>
+
+<div class="grid">
+  <div class="card">
+    <h2>第一轮数据上传</h2>
+    <input type="file" id="r1-csv" accept=".csv">
+    <input type="file" id="r1-pq" accept=".parquet">
+    <button onclick="upload(1)" id="r1-btn">上传第一轮</button>
+    <div class="msg" id="r1-msg"></div>
+  </div>
+  <div class="card">
+    <h2>第二轮数据上传</h2>
+    <input type="file" id="r2-csv" accept=".csv">
+    <input type="file" id="r2-pq" accept=".parquet">
+    <button onclick="upload(2)" id="r2-btn">上传第二轮</button>
+    <div class="msg" id="r2-msg"></div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>已发布数据</h2>
+  <table id="status-table"><thead>
+    <tr><th>轮次</th><th>状态</th><th>代际</th><th>样本数</th><th>重抽次数</th><th>重抽权重行数</th><th>发布时间</th></tr>
+  </thead><tbody></tbody></table>
+</div>
+
+<div class="card" style="margin-top:16px">
+  <h2>分区查询</h2>
+  <select id="district"><option value="">（请先上传数据）</option></select>
+  <button onclick="runQuery()" id="q-btn" style="margin-left:8px">计算比例差与 95% 区间</button>
+  <div class="result" id="result"></div>
+</div>
+
+<div class="muted">
+  口径：主权重比例 p = Σ(权重×是否乘公交) / Σ(权重)，比例差为第二轮减第一轮；重抽按相同 <code>rep_id</code> 配对，
+  区间端点取各次重抽比例差的线性插值 2.5% 与 97.5% 分位数（type-7）。<br>
+  两轮重抽编号集合不同、主权重或重抽权重分母为零时区间留空并说明原因。每次查询固定使用查询开始时已发布的两套输入，上传换表不影响进行中的查询。
+</div>
+
+<script>
+const fmt = n => (n === null || n === undefined) ? "—" : Number(n).toFixed(6);
+const fmtInt = n => (n === null || n === undefined) ? "—" : Number(n).toLocaleString("zh-CN");
+
+async function upload(round) {
+  const csv = document.getElementById(`r${round}-csv`).files[0];
+  const pq = document.getElementById(`r${round}-pq`).files[0];
+  const msg = document.getElementById(`r${round}-msg`);
+  const btn = document.getElementById(`r${round}-btn`);
+  msg.className = "msg"; msg.textContent = "";
+  if (!csv || !pq) { msg.className = "msg err"; msg.textContent = "请同时选择样本 CSV 和重抽权重 Parquet"; return; }
+  const fd = new FormData();
+  fd.append("sample_csv", csv); fd.append("replicate_parquet", pq);
+  btn.disabled = true; msg.textContent = "上传与校验中…";
+  try {
+    const resp = await fetch(`/api/rounds/${round}`, { method: "POST", body: fd });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || "上传失败");
+    msg.className = "msg ok";
+    msg.textContent = `已发布为第 ${data.generation} 代：样本 ${fmtInt(data.n_samples)}，重抽 ${fmtInt(data.n_replicates)} 次，权重行 ${fmtInt(data.n_rep_rows)}`;
+  } catch (e) {
+    msg.className = "msg err"; msg.textContent = "校验失败（旧数据仍可查询）：" + e.message;
+  } finally {
+    btn.disabled = false; refresh();
+  }
+}
+
+async function refresh() {
+  const resp = await fetch("/api/status");
+  const s = await resp.json();
+  const tb = document.querySelector("#status-table tbody");
+  tb.innerHTML = "";
+  for (const r of [1, 2]) {
+    const d = s.rounds[String(r)];
+    const tr = document.createElement("tr");
+    if (d.loaded) {
+      tr.innerHTML = `<td>第${r}轮</td><td><span class="pill on">已发布</span></td>
+        <td>${d.generation}</td><td>${fmtInt(d.n_samples)}</td>
+        <td>${fmtInt(d.n_replicates)}</td><td>${fmtInt(d.n_rep_rows)}</td>
+        <td>${d.created_at.replace("T"," ").replace(/\..*/,"")}</td>`;
+    } else {
+      tr.innerHTML = `<td>第${r}轮</td><td><span class="pill off">未上传</span></td>
+        <td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>`;
+    }
+    tb.appendChild(tr);
+  }
+  const sel = document.getElementById("district");
+  const prev = sel.value;
+  sel.innerHTML = "";
+  if (!s.districts.length) {
+    sel.innerHTML = '<option value="">（请先上传数据）</option>';
+  } else {
+    for (const d of s.districts) {
+      const o = document.createElement("option"); o.value = d; o.textContent = d; sel.appendChild(o);
+    }
+    if (s.districts.includes(prev)) sel.value = prev;
+  }
+}
+
+async function runQuery() {
+  const district = document.getElementById("district").value;
+  const box = document.getElementById("result");
+  if (!district) { box.innerHTML = '<span class="err">请先选择一个区</span>'; return; }
+  box.innerHTML = '<span class="muted">计算中…</span>';
+  const resp = await fetch("/api/result?district=" + encodeURIComponent(district));
+  const d = await resp.json();
+  if (!resp.ok) { box.innerHTML = `<span class="err">${d.detail}</span>`; return; }
+  let html = '<div class="kv">';
+  html += `<div class="k">选区</div><div>${d.district}</div>`;
+  if (d.available === false) {
+    html += `<div class="k">结果</div><div class="err">${d.reason}</div></div>`;
+    box.innerHTML = html; return;
+  }
+  html += `<div class="k">第一轮比例</div><div>${fmt(d.round1.proportion)}（分母 ${fmt(d.round1.weight_sum)}）</div>`;
+  html += `<div class="k">第二轮比例</div><div>${fmt(d.round2.proportion)}（分母 ${fmt(d.round2.weight_sum)}）</div>`;
+  html += `<div class="k">比例差（二减一）</div><div class="big">${fmt(d.point_estimate)}</div>`;
+  if (d.ci_low === null || d.ci_high === null) {
+    html += `<div class="k">95% 重抽区间</div><div class="err">留空：${d.reason}</div>`;
+  } else {
+    html += `<div class="k">重抽次数</div><div>${fmtInt(d.n_replicates)}</div>`;
+    html += `<div class="k">2.5% 分位数</div><div>${fmt(d.ci_low)}</div>`;
+    html += `<div class="k">97.5% 分位数</div><div>${fmt(d.ci_high)}</div>`;
+    html += `<div class="k">95% 重抽区间</div><div class="big">[${fmt(d.ci_low)}, ${fmt(d.ci_high)}]</div>`;
+  }
+  html += "</div>";
+  box.innerHTML = html;
+}
+
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>
